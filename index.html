@@ -69,13 +69,13 @@ const LEGACY_WEDGES = [
   [200,'#7bdec1'], [350,'#f7b97d'], [300,'#94c4f7'], [500,'#efacd0']
 ];
 const SPIN_MS = 3200;
+const LIVE_SPIN_LEAD_MS = 450;
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
 let serverOffset = 0;
 let wheelFrame = 0;
 let wheelAudio = null;
 let spinPending = false;
-let lastWheelTick = '';
-let lastWheelLanding = null;
+let wheelAudioUrl = null;
 let renderedRound = null;
 let renderedAnswering = false;
 
@@ -102,7 +102,7 @@ async function joinSession(){let c=clean($('#joinCode').value,6).replace(/\D/g,'
 async function update(patch){if(!session)return;if(live){await db.ref('sessions/'+code).update(patch)}else{Object.assign(session,patch);render()}}
 function players(){return session?.players||previewPlayers}
 function responses(){return session?.responses||previewResponses}
-async function selectGame(g){await update({game:g,status:'lobby',question:null,questionIndex:-1,deadline:0,wheel:null,wheelPattern:null,revealed:false,revealedLetters:'',found:[],responses:null,message:'Select a question to begin'})}
+async function selectGame(g){stopWheelSound();await update({game:g,status:'lobby',question:null,questionIndex:-1,deadline:0,wheel:null,wheelPattern:null,revealed:false,revealedLetters:'',found:[],responses:null,message:'Select a question to begin'})}
 function gameQs(){return localBank.filter(q=>q.g===session.game)}
 async function startQuestion(index) {
   const question = gameQs()[index];
@@ -153,7 +153,7 @@ async function revealLetter() {
 }
 async function markFeud(idx){let f=session.found||[];if(f.includes(idx))f=f.filter(x=>x!==idx);else f=[...f,idx];await update({found:f})}
 async function resetScores(){if(!confirm('Reset all player scores?'))return;for(let id of Object.keys(players())){if(live)await db.ref('sessions/'+code+'/players/'+id+'/score').set(0);else previewPlayers[id].score=0}render()}
-async function endSession(){if(!confirm('End this game room for everyone?'))return;if(live)await db.ref('sessions/'+code).remove();if(unsub)unsub();localStorage.removeItem('rcrHostSession');role='landing';session=null;code='';render()}
+async function endSession(){if(!confirm('End this game room for everyone?'))return;stopWheelSound();if(live)await db.ref('sessions/'+code).remove();if(unsub)unsub();localStorage.removeItem('rcrHostSession');role='landing';session=null;code='';render()}
 function board(){let qs=gameQs();if(!qs.length)return '<p>No questions. Add one in the facilitator editor.</p>';if(session.game==='jeopardy'){let cats=[...new Set(qs.map(q=>q.cat))];return '<div class="grid">'+cats.map(c=>'<div><h3>'+esc(c)+'</h3>'+qs.map((q,i)=>q.cat===c?`<button class="secondary" style="width:100%;margin:3px 0" onclick="startQuestion(${i})">${esc(q.pts)} points</button>`:'').join('')+'</div>').join('')+'</div>'}return '<div class="grid">'+qs.map((q,i)=>`<button class="secondary" onclick="startQuestion(${i})">${esc(q.cat)} · ${esc(q.g === 'wheel' ? 'Puzzle ' + (i + 1) : q.q)}</button>`).join('')+'</div>'}
 function gameNow() {
   return Date.now() + serverOffset;
@@ -208,34 +208,34 @@ async function spinWheel() {
   if (role !== 'host' || spinPending || !wheelCanSpin(room)) return;
   spinPending = true;
   try {
-    if (soundOn) {
-      try {
-        wheelAudio ||= new (window.AudioContext || window.webkitAudioContext)();
-        wheelAudio.resume().catch(() => {});
-      } catch {}
-    }
-
     const segment = Math.floor(Math.random() * PHOTO_WEDGES.length);
     const isPoints = typeof PHOTO_WEDGES[segment][0] === 'number';
+    const fromAngle = wheelAngle(room.wheel);
+    const leadMs = live ? LIVE_SPIN_LEAD_MS : 0;
+    if (soundOn) playWheelSound(wheelSounds(segment, fromAngle, leadMs, isPoints));
     const spinPatch = current => {
-      const startsAt = gameNow() + (live ? 450 : 0);
+      const startsAt = gameNow() + leadMs;
       const endsAt = startsAt + SPIN_MS;
       return {
-        wheel: {layout: 'reference', segment, startsAt, endsAt, fromAngle: wheelAngle(current.wheel)},
+        wheel: {layout: 'reference', segment, startsAt, endsAt, fromAngle},
         status: isPoints ? 'playing' : 'paused',
         deadline: isPoints ? endsAt + roundDuration(current) : 0
       };
     };
 
     if (live) {
-      await db.ref('sessions/' + code).transaction(current => {
+      const result = await db.ref('sessions/' + code).transaction(current => {
         if (!current || current.hostUid !== uid || current.round !== room.round ||
             current.wheel?.startsAt !== room.wheel?.startsAt || !wheelCanSpin(current)) return;
         return {...current, ...spinPatch(current)};
       }, undefined, false);
+      if (!result.committed) stopWheelSound();
     } else {
       await update(spinPatch(room));
     }
+  } catch (error) {
+    stopWheelSound();
+    throw error;
   } finally {
     spinPending = false;
   }
@@ -262,21 +262,98 @@ function renderWheel() {
       </div>
     </div>
     <p id="wheelResult" class="wheel-result" role="status"></p>
+    ${role === 'host' ? '<button class="secondary" onclick="testWheelSound()">Test sound</button>' : ''}
     ${role === 'host' && !session.revealed && (!session.wheel || hasSpecial) ?
       `<button id="spinButton" onclick="spinWheel()" ${wheelIsMoving() ? 'hidden' : ''}>${hasSpecial ? 'Spin again' : 'Spin the wheel'}</button>` : ''}
   </div>`;
 }
 
-function wheelTone(frequency, duration, volume, delay = 0) {
-  const starts = wheelAudio.currentTime + delay;
-  const oscillator = wheelAudio.createOscillator();
-  const gain = wheelAudio.createGain();
-  oscillator.frequency.value = frequency;
-  oscillator.connect(gain).connect(wheelAudio.destination);
-  gain.gain.setValueAtTime(volume, starts);
-  gain.gain.exponentialRampToValueAtTime(0.001, starts + duration);
-  oscillator.start(starts);
-  oscillator.stop(starts + duration);
+function landingSounds(at, isPoints) {
+  return isPoints
+    ? [[at, 523.25, 0.21, 0.43], [at + 0.09, 659.25, 0.23, 0.38], [at + 0.18, 783.99, 0.31, 0.35]]
+    : [[at, 330, 0.22, 0.45], [at + 0.11, 220, 0.32, 0.4]];
+}
+
+function wheelSounds(segment, fromAngle, leadMs, isPoints) {
+  const step = 360 / PHOTO_WEDGES.length;
+  const travel = 5 * 360 + (360 + wheelAngle({layout:'reference', segment}) - fromAngle) % 360;
+  const lead = leadMs / 1000;
+  const duration = SPIN_MS / 1000;
+  const ticks = [];
+  let previous = -Infinity;
+  for (let crossed = step / 2; crossed < travel; crossed += step) {
+    const at = duration * (1 - Math.cbrt(1 - crossed / travel));
+    if (at - previous >= 0.027) {
+      ticks.push([lead + at, 950, 0.024, 0.32]);
+      previous = at;
+    }
+  }
+  return ticks.concat(landingSounds(lead + duration, isPoints));
+}
+
+function stopWheelSound() {
+  const audio = wheelAudio;
+  wheelAudio = null;
+  if (audio) audio.pause();
+  if (wheelAudioUrl) URL.revokeObjectURL(wheelAudioUrl);
+  wheelAudioUrl = null;
+}
+
+function playWheelSound(notes) {
+  stopWheelSound();
+  try {
+    const rate = 22050;
+    const sampleCount = Math.ceil(Math.max(...notes.map(([at,,duration]) => at + duration)) * rate);
+    const samples = new Float32Array(sampleCount);
+    for (const [at, frequency, duration, volume] of notes) {
+      const offset = Math.round(at * rate);
+      const count = Math.min(sampleCount - offset, Math.floor(duration * rate));
+      for (let i = 0; i < count; i++) {
+        const t = i / rate;
+        const envelope = Math.min(1, t / 0.004) * Math.pow(1 - t / duration, 2);
+        samples[offset + i] += Math.sin(2 * Math.PI * frequency * t) * envelope * volume;
+      }
+    }
+
+    const wav = new DataView(new ArrayBuffer(44 + sampleCount * 2));
+    wav.setUint32(0, 0x52494646); // RIFF
+    wav.setUint32(4, wav.byteLength - 8, true);
+    wav.setUint32(8, 0x57415645); // WAVE
+    wav.setUint32(12, 0x666d7420); // fmt
+    wav.setUint32(16, 16, true);
+    wav.setUint16(20, 1, true); // PCM
+    wav.setUint16(22, 1, true); // Mono
+    wav.setUint32(24, rate, true);
+    wav.setUint32(28, rate * 2, true);
+    wav.setUint16(32, 2, true);
+    wav.setUint16(34, 16, true);
+    wav.setUint32(36, 0x64617461); // data
+    wav.setUint32(40, sampleCount * 2, true);
+    samples.forEach((sample, index) => {
+      wav.setInt16(44 + index * 2, Math.round(Math.max(-1, Math.min(1, sample)) * 32767), true);
+    });
+
+    wheelAudioUrl = URL.createObjectURL(new Blob([wav], {type:'audio/wav'}));
+    const audio = new Audio(wheelAudioUrl);
+    wheelAudio = audio;
+    audio.addEventListener('ended', () => {
+      if (wheelAudio === audio) stopWheelSound();
+    }, {once:true});
+    audio.play().catch(() => {
+      if (wheelAudio !== audio) return;
+      stopWheelSound();
+      toast('Audio was blocked. Tap Test sound to try again.');
+    });
+  } catch {
+    stopWheelSound();
+    toast('Audio could not start. Check your device sound settings.');
+  }
+}
+
+function testWheelSound() {
+  if (wheelIsMoving()) return;
+  soundOn = true;
+  playWheelSound(landingSounds(0, true));
 }
 
 function animateWheel() {
@@ -292,7 +369,6 @@ function animateWheel() {
     return;
   }
 
-  const step = 360 / wheelWedges(spin).length;
   const from = spin.fromAngle || 0;
   const rotation = 5 * 360 + (360 + wheelAngle(spin) - from) % 360;
   const isPoints = typeof outcome === 'number';
@@ -305,26 +381,6 @@ function animateWheel() {
     const label = progress < 1 ? 'Spinning…' : landing;
     if (result.textContent !== label) result.textContent = label;
 
-    if (role === 'host' && soundOn && wheelAudio?.state === 'running') {
-      if (progress > 0 && progress < 1) {
-        const marker = spin.startsAt + ':' + Math.floor((angle + step / 2) / step);
-        if (lastWheelTick !== marker) {
-          lastWheelTick = marker;
-          wheelTone(740, 0.023, 0.07);
-        }
-      } else if (progress === 1 && now - spin.endsAt < 650 && lastWheelLanding !== spin.startsAt) {
-        lastWheelLanding = spin.startsAt;
-        if (isPoints) {
-          wheelTone(523.25, 0.21, 0.11);
-          wheelTone(659.25, 0.23, 0.1, 0.09);
-          wheelTone(783.99, 0.31, 0.1, 0.18);
-        } else {
-          wheelTone(330, 0.22, 0.1);
-          wheelTone(220, 0.32, 0.1, 0.11);
-        }
-      }
-    }
-
     if (progress < 1) wheelFrame = requestAnimationFrame(draw);
     else if ($('#spinButton')) $('#spinButton').hidden = false;
   }
@@ -333,7 +389,7 @@ function animateWheel() {
 function scoreTable(){let ps=Object.entries(players()).map(([id,p])=>({id,...p}));if(!ps.length)return '<p class="muted">No clients joined yet.</p>';if(session.mode==='teams'){const scores=TEAMS.map(t=>({team:t,score:ps.filter(p=>p.team===t).reduce((sum,p)=>sum+(p.score||0),0),count:ps.filter(p=>p.team===t).length}));return '<div class="grid">'+scores.map(p=>`<div class="team">${esc(p.team)} · ${p.count} clients <b class="score">${p.score}</b></div>`).join('')+'</div>'}return '<div class="grid">'+ps.sort((a,b)=>(b.score||0)-(a.score||0)).map(p=>`<div class="team">${esc(p.name)} <b class="score">${p.score||0}</b></div>`).join('')+'</div>'}
 function hostRound(){if(!session.question)return `<div class="panel"><h2>Choose a question</h2>${board()}</div>`;let q=session.question,ans=answerForRound(),rs=responses(),ps=players();const points=q.g==='wheel'?wheelPoints():q.pts;return `<div class="panel"><div class="row spread"><span class="pill">${esc(GAMES.find(x=>x[0]===session.game)?.[2])} · ${esc(q.cat)}${points && !wheelIsMoving() ? ' · '+esc(points)+' pts' : ''}</span><span id="timer" class="timer">${getTime()}</span></div><div class="question">${esc(q.q)}</div>${q.hint?`<p>Hint: ${esc(q.hint)}</p>`:''}${q.g==='jeopardy'?`<div class="choices">${q.choices.map((c,i)=>`<div class="choice ${session.revealed&&ans?.a===i?'correct':''}" style="padding:12px;border-radius:10px">${String.fromCharCode(65+i)}. ${esc(c)}</div>`).join('')}</div>`:''}${q.g==='wheel'?`${renderWheel()}<div class="puzzle">${esc(session.wheelPattern || maskPhrase(ans?.q || ""))}</div><div class="row"><input id="letterBox" maxlength="1" placeholder="Letter"><button class="secondary" onclick="revealLetter()">Reveal letter</button></div>`:''}${q.g==='feud'?`<div class="grid">${(ans?.answers||[]).map((a,i)=>`<button onclick="markFeud(${i})" class="${(session.found||[]).includes(i)?'':'secondary'}">${(session.found||[]).includes(i)?esc(a):'Answer '+(i+1)+' · Tap to reveal'}</button>`).join('')}</div>`:''}<div class="row" style="margin-top:16px"><button onclick="restartTimer()" ${session.revealed || wheelIsMoving() || (q.g==='wheel' && !wheelPoints()) ? 'disabled' : ''}>↻ Start ${roundDuration(session)/1000}-sec timer</button><button class="secondary" onclick="stopTimer()" ${!canAnswer() ? 'disabled' : ''}>Pause</button><button onclick="reveal()" ${wheelIsMoving() ? 'disabled' : ''}>Reveal / Close round</button><button class="secondary" onclick="update({question:null,status:'lobby',deadline:0,wheel:null,wheelPattern:null,responses:null})">New question</button></div>${session.revealed?`<div class="status">${q.g==='jeopardy'?'Correct answer: '+esc(ans?.choices?.[ans?.a]):q.g==='wheel'?'Solution: '+esc(ans?.q):'All survey answers revealed'}</div>`:''}</div><div class="panel"><h2>Responses (${Object.keys(rs).length})</h2>${Object.entries(rs).length?Object.entries(rs).map(([id,r])=>`<div class="submission submit-card"><div><b>${esc(ps[id]?.name||'Player')}</b> <span class="tag">${esc(ps[id]?.team||'')}</span><div>${q.g==='jeopardy'?esc(q.choices[Number(r.value)]||'Unknown'):esc(r.value)}</div></div><div class="row"><button class="secondary" onclick="scoreUser('${id}',${Number(points)||0})">+${esc(points)} pts</button><button class="secondary" onclick="scoreUser('${id}',-${Number(points)||0})">−${esc(points)} pts</button></div></div>`).join(''):'<p class="muted">Waiting for answers from connected phones.</p>'}<p class="note">Jeopardy awards correct answers automatically when you click Reveal. Manual +/− buttons are for corrections, Wheel, and Feud. Avoid scoring the same response twice.</p></div>`}
 function renderHost(){let share=live?`<div class="pin">${code}</div><p>Clients open <a target="_blank" href="${esc(link())}">${esc(link())}</a></p><div class="row"><button onclick="copyJoin()">Copy join link</button><button class="secondary" onclick="window.print()">Print page</button></div>`:`<div class="status warn"><b>Local preview only.</b> The host dashboard and question bank work here. To connect clients on their own phones, configure Firebase and publish this file on GitHub Pages.</div>`;
-return `<div class="panel"><div class="row spread"><div><h1>Facilitator dashboard</h1><p class="muted">${session.mode==='teams'?'Team competition':'Individual scoring'} · ${Object.keys(players()).length} joined</p></div><button class="danger" onclick="endSession()">End room</button></div>${share}</div><div class="panel"><div class="row spread"><h2>Choose a game</h2><div class="row"><label>Timer (seconds)<input type="number" min="5" max="120" style="width:95px" value="${roundDuration(session)/1000}" onchange="update({[session.game==='wheel'?'wheelDuration':'duration']:Math.min(120,Math.max(5,Number(this.value)||roundDuration(session)/1000))})"></label><button class="secondary" onclick="soundOn=!soundOn;toast('Sound '+(soundOn?'on':'off'))">🔊 Toggle sound</button></div></div><div class="gamegrid">${GAMES.map(g=>`<div class="gamecard ${session.game===g[0]?'selected':''}" onclick="selectGame('${g[0]}')"><div style="font-size:32px">${g[1]}</div><b>${g[2]}</b><p class="small">${g[3]}</p></div>`).join('')}</div></div>${hostRound()}<div class="panel"><div class="row spread"><h2>Live scoreboard</h2><button class="secondary" onclick="resetScores()">Reset scores</button></div>${scoreTable()}</div><div class="panel"><details><summary>✏️ Add / edit game questions</summary><p class="note">Custom questions are saved in this facilitator's browser. Publish the updated HTML to make built-in content universal.</p><div class="grid"><label>Game<select id="editGame"><option value="jeopardy">Jeopardy</option><option value="wheel">Wheel of Fortune</option><option value="feud">Family Feud</option></select></label><label>Category<input id="editCat" placeholder="Recovery Skills"></label><label>Points<input id="editPts" type="number" value="100" min="1"></label></div><label>Question or puzzle phrase<input id="editQ" placeholder="Enter your question"></label><label>Options / survey answers (one per line). For Jeopardy, enter four options and make the first correct.<textarea id="editAnswers" placeholder="Correct answer\nOther answer\nOther answer\nOther answer"></textarea></label><button onclick="addQuestion()">Add question</button> <button class="secondary" onclick="exportBank()">Export questions JSON</button> <button class="secondary" onclick="document.getElementById('importBank').click()">Import questions</button><input class="hidden" id="importBank" type="file" accept="application/json" onchange="importBank(event)"><button class="danger" onclick="resetBank()">Restore built-in questions</button><p class="note">To change which Jeopardy option is correct, import a JSON bank with the <code>a</code> index (0–3). Or put the correct option first when adding questions.</p></details></div>`}
+return `<div class="panel"><div class="row spread"><div><h1>Facilitator dashboard</h1><p class="muted">${session.mode==='teams'?'Team competition':'Individual scoring'} · ${Object.keys(players()).length} joined</p></div><button class="danger" onclick="endSession()">End room</button></div>${share}</div><div class="panel"><div class="row spread"><h2>Choose a game</h2><div class="row"><label>Timer (seconds)<input type="number" min="5" max="120" style="width:95px" value="${roundDuration(session)/1000}" onchange="update({[session.game==='wheel'?'wheelDuration':'duration']:Math.min(120,Math.max(5,Number(this.value)||roundDuration(session)/1000))})"></label><button class="secondary" onclick="soundOn=!soundOn;if(!soundOn)stopWheelSound();toast('Sound '+(soundOn?'on':'off'))">🔊 Toggle sound</button></div></div><div class="gamegrid">${GAMES.map(g=>`<div class="gamecard ${session.game===g[0]?'selected':''}" onclick="selectGame('${g[0]}')"><div style="font-size:32px">${g[1]}</div><b>${g[2]}</b><p class="small">${g[3]}</p></div>`).join('')}</div></div>${hostRound()}<div class="panel"><div class="row spread"><h2>Live scoreboard</h2><button class="secondary" onclick="resetScores()">Reset scores</button></div>${scoreTable()}</div><div class="panel"><details><summary>✏️ Add / edit game questions</summary><p class="note">Custom questions are saved in this facilitator's browser. Publish the updated HTML to make built-in content universal.</p><div class="grid"><label>Game<select id="editGame"><option value="jeopardy">Jeopardy</option><option value="wheel">Wheel of Fortune</option><option value="feud">Family Feud</option></select></label><label>Category<input id="editCat" placeholder="Recovery Skills"></label><label>Points<input id="editPts" type="number" value="100" min="1"></label></div><label>Question or puzzle phrase<input id="editQ" placeholder="Enter your question"></label><label>Options / survey answers (one per line). For Jeopardy, enter four options and make the first correct.<textarea id="editAnswers" placeholder="Correct answer\nOther answer\nOther answer\nOther answer"></textarea></label><button onclick="addQuestion()">Add question</button> <button class="secondary" onclick="exportBank()">Export questions JSON</button> <button class="secondary" onclick="document.getElementById('importBank').click()">Import questions</button><input class="hidden" id="importBank" type="file" accept="application/json" onchange="importBank(event)"><button class="danger" onclick="resetBank()">Restore built-in questions</button><p class="note">To change which Jeopardy option is correct, import a JSON bank with the <code>a</code> index (0–3). Or put the correct option first when adding questions.</p></details></div>`}
 function renderPlayer(){if(!session)return '<div class="panel">Loading room…</div>';let p=players()?.[uid];if(!p)return '<div class="panel"><h2>Not in room</h2><button onclick="role=\'join\';render()">Join again</button></div>';let q=session.question;let r=responses()[uid];return `<div class="panel"><div class="row spread"><div><h1>Hello, ${esc(p.name)}!</h1><span class="pill">${esc(session.mode==='teams'?p.team:'Individual mode')} · ${esc(code)}</span></div><span class="score">${p.score||0} pts</span></div></div><div class="panel"><div class="row spread"><span class="pill">${esc(GAMES.find(g=>g[0]===session.game)?.[2])}</span><span id="timer" class="timer">${getTime()}</span></div>${!q?`<div class="bigcenter"><h2>You're in!</h2><p>Waiting for facilitator to start a question.</p></div>`:`<div><div class="question">${esc(q.q)}</div>${q.hint?`<p>Hint: ${esc(q.hint)}</p>`:''}${q.g==='wheel'?`${renderWheel()}<div class="puzzle">${esc(session.wheelPattern || (q.pattern || '').replaceAll('_','▢'))}</div>`:''}${r?`<div class="status">✓ Your answer was submitted: ${esc(q.g==='jeopardy'?q.choices[Number(r.value)]:r.value)}</div>`:canAnswer()?(q.g==='jeopardy'?`<div class="choices">${q.choices.map((c,i)=>`<button class="choice" onclick="sendAnswer('${i}')">${String.fromCharCode(65+i)}. ${esc(c)}</button>`).join('')}</div>`:`<label>Your ${q.g==='wheel'?'letter or full phrase':'survey answer'}<input id="typedAnswer" maxlength="140" placeholder="Type your answer"></label><button style="margin-top:12px" onclick="sendAnswer(document.getElementById('typedAnswer').value)">Submit answer</button>`):`<div class="status">${session.revealed?'Round complete!':q.g==='wheel'&&(!wheelPoints()||wheelIsMoving())?'Guesses open after a points spin.':'Time is up or facilitator paused the round.'}</div>`}</div>`}</div><div class="panel"><h2>Scoreboard</h2>${scoreTable()}</div>`}
 function render(){if(!$('#app'))return;if(role==='landing'){ $('#app').innerHTML=`<div class="bigcenter"><h1>Recovery games, together.</h1><p class="muted">Host from your iPad. Clients answer from their own phones.</p></div><div class="grid"><div class="panel"><h2>🎮 Facilitator</h2><p>Create a room, lead the games, and control scoring.</p><label>Competition mode<select id="mode"><option value="individual">Individual players</option><option value="teams">Teams</option></select></label><br><button class="wide" onclick="hostCreate()">Create game room</button></div><div class="panel"><h2>📱 Client</h2><p>Enter the room PIN from your facilitator.</p><button class="wide secondary" onclick="role='join';render()">Join a game</button></div></div><div class="panel"><h2>Included games</h2><div class="gamegrid">${GAMES.map(g=>`<div class="gamecard"><div style="font-size:32px">${g[1]}</div><b>${g[2]}</b><p class="small">${g[3]}</p></div>`).join('')}</div></div>${!live?'<div class="status warn">This copy opens in local preview mode until the facilitator adds Firebase settings. The online multiplayer setup is described in README.md.</div>':''}`;return}if(role==='join'){ $('#app').innerHTML=`<div class="panel" style="max-width:550px;margin:24px auto"><h1>Join game room</h1><label>6-digit room PIN<input id="joinCode" inputmode="numeric" maxlength="6" placeholder="123456" value="${esc(code)}"></label><br><label>Nickname (not your full name)<input id="nickname" maxlength="25" placeholder="e.g. Sunshine"></label><br><label>Team (only used for team games)<select id="teamPicker">${TEAMS.map(t=>`<option>${esc(t)}</option>`).join('')}</select></label><br><button class="wide" onclick="joinSession()">Join game</button><p class="note">Do not use full names or share medical information.</p><button class="secondary" onclick="role='landing';render()">Back</button></div>`;return}const roundKey = session ? code + ':' + session.round + ':' + session.game : null;
   const input = $('#typedAnswer') || $('#letterBox');
